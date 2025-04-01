@@ -9,6 +9,7 @@ import ctypes
 import logging
 import pystray
 import re
+import pygame
 from PIL import Image, ImageDraw, ImageTk
 
 # --- Tracking van verbindingen ---
@@ -100,6 +101,189 @@ tray_icon = None     # pystray icon
 menu_state = "idle"  # Huidige menustatus (idle, main_menu, settings, mapping)
 waiting_for_enter = False  # Als de app wacht op enter toetsen
 event_loop_terminating = False  # De event loop is aan het afsluiten
+
+
+
+
+# --- GUI verbeteringen voor mapping ---
+def gui_wait_for_mapping_input(joystick):
+    """
+    GUI-friendly version of waiting for input mapping with buttons instead of commands.
+    """
+    # Create a dialog window
+    dialog = tk.Toplevel(root)
+    dialog.title("Map Input")
+    dialog.geometry("400x300")
+    dialog.transient(root)  # Make the dialog dependent on the main window
+    dialog.grab_set()  # Make the dialog modal
+    
+    chosen_input = [None]  # Use a list to be able to modify the value in nested functions
+    last_axis_values = [0.0] * joystick.get_numaxes()  # Store last axis values for comparison
+    
+    # Instructions
+    tk.Label(dialog, text="Move the joystick or press a button to map this action").pack(pady=10)
+    
+    # Selection display
+    selection_var = tk.StringVar(value="Nothing selected yet")
+    tk.Label(dialog, textvariable=selection_var).pack(pady=20)
+    
+    # Button frame
+    button_frame = tk.Frame(dialog)
+    button_frame.pack(side=tk.BOTTOM, pady=20)
+    
+    # Confirm button (initially disabled)
+    confirm_button = tk.Button(button_frame, text="Confirm", state=tk.DISABLED)
+    confirm_button.pack(side=tk.LEFT, padx=10)
+    
+    # Cancel button
+    cancel_button = tk.Button(button_frame, text="Cancel")
+    cancel_button.pack(side=tk.LEFT, padx=10)
+    
+    # Update function for input detection
+    def update_detection():
+        pygame.event.pump()
+        
+        # Check axes
+        for axis_idx in range(joystick.get_numaxes()):
+            value = joystick.get_axis(axis_idx)
+            if abs(value - last_axis_values[axis_idx]) > 0.01:
+                last_axis_values[axis_idx] = value
+                if abs(value) > 0.3:
+                    direction = "positive" if value > 0 else "negative"
+                    new_input = ("axis", axis_idx, direction)
+                    chosen_input[0] = new_input
+                    selection_var.set(f"Selected: axis {axis_idx} ({direction})")
+                    confirm_button.config(state=tk.NORMAL)
+                
+        # Check buttons
+        for btn_idx in range(joystick.get_numbuttons()):
+            if joystick.get_button(btn_idx):
+                new_input = ("button", btn_idx)
+                chosen_input[0] = new_input
+                selection_var.set(f"Selected: button {btn_idx}")
+                confirm_button.config(state=tk.NORMAL)
+        
+        # Only continue with detection if the dialog still exists
+        if dialog.winfo_exists():
+            dialog.after(50, update_detection)
+    
+    # Event handlers
+    def on_confirm():
+        dialog.destroy()
+    
+    def on_cancel():
+        chosen_input[0] = None
+        dialog.destroy()
+    
+    # Button callbacks
+    confirm_button.config(command=on_confirm)
+    cancel_button.config(command=on_cancel)
+    
+    # Start detection
+    update_detection()
+    
+    # Wait until the dialog is closed
+    dialog.wait_window(dialog)
+    
+    # Show what was selected in console (for consistency with CLI version)
+    if chosen_input[0]:
+        if chosen_input[0][0] == "button":
+            print(f"Selected input: button {chosen_input[0][1]}")
+        else:
+            print(f"Selected input: axis {chosen_input[0][1]} ({chosen_input[0][2]})")
+    
+    # Process the result
+    return chosen_input[0]
+
+# --- Aanhaken aan de main-module voor verbeterde GUI-interactie ---
+def setup_gui_enhancements():
+    """
+    Vervang bepaalde functies van main.py door GUI-verbeterde versies als de tray-app draait
+    """
+    if hasattr(main, 'wait_for_mapping_input'):
+        # Back-up de originele functie
+        main._original_wait_for_mapping_input = main.wait_for_mapping_input
+        # Vervang door GUI-vriendelijke versie
+        main.wait_for_mapping_input = gui_wait_for_mapping_input
+        print("[DEBUG] Enhanced wait_for_mapping_input with GUI version")
+    
+    if hasattr(main, 'wait_for_preset_button_mapping'):
+        # Back-up de originele functie
+        main._original_wait_for_preset_button_mapping = main.wait_for_preset_button_mapping
+        # Vervang door GUI-vriendelijke versie
+        main.wait_for_preset_button_mapping = gui_wait_for_preset_button_mapping
+        print("[DEBUG] Enhanced wait_for_preset_button_mapping with GUI version")
+
+def gui_wait_for_preset_button_mapping(device):
+    """
+    GUI-friendly version of waiting for preset button mapping.
+    """
+    # Similar implementation as gui_wait_for_mapping_input but only for buttons
+    dialog = tk.Toplevel(root)
+    dialog.title("Map Preset Button")
+    dialog.geometry("400x300")
+    dialog.transient(root)
+    dialog.grab_set()
+    
+    chosen_button = [None]
+    
+    # Instructions
+    tk.Label(dialog, text="Press a button to assign to this preset").pack(pady=10)
+    
+    # Selection display
+    selection_var = tk.StringVar(value="No button selected yet")
+    tk.Label(dialog, textvariable=selection_var).pack(pady=20)
+    
+    # Button frame
+    button_frame = tk.Frame(dialog)
+    button_frame.pack(side=tk.BOTTOM, pady=20)
+    
+    # Confirm button (initially disabled)
+    confirm_button = tk.Button(button_frame, text="Confirm", state=tk.DISABLED)
+    confirm_button.pack(side=tk.LEFT, padx=10)
+    
+    # Cancel button
+    cancel_button = tk.Button(button_frame, text="Cancel")
+    cancel_button.pack(side=tk.LEFT, padx=10)
+    
+    # Update function
+    def update_detection():
+        pygame.event.pump()
+        
+        for btn_idx in range(device.get_numbuttons()):
+            if device.get_button(btn_idx):
+                chosen_button[0] = btn_idx
+                selection_var.set(f"Selected button: {btn_idx}")
+                confirm_button.config(state=tk.NORMAL)
+                time.sleep(0.2)  # Basic debounce
+        
+        if dialog.winfo_exists():
+            dialog.after(50, update_detection)
+    
+    # Event handlers
+    def on_confirm():
+        dialog.destroy()
+    
+    def on_cancel():
+        chosen_button[0] = None
+        dialog.destroy()
+    
+    # Button callbacks
+    confirm_button.config(command=on_confirm)
+    cancel_button.config(command=on_cancel)
+    
+    # Start detection
+    update_detection()
+    
+    # Wait until the dialog is closed
+    dialog.wait_window(dialog)
+    
+    # Show result in console
+    if chosen_button[0] is not None:
+        print(f"Selected Button: {chosen_button[0]}")
+    
+    return ("button", chosen_button[0]) if chosen_button[0] is not None else None
+
 
 # --- Resource Laden ---
 def resource_path(relative_path):
@@ -265,13 +449,13 @@ class APCRControllerApp:
     
     def send_command(self, event=None):
         cmd = self.input_field.get().strip()
-        if cmd:
-            self.append_console_text("> " + cmd + "\n", "command")
-            # Nu sturen we het commando naar de aangepaste stdin
-            custom_stdin.write(cmd)
-            self.command_history.append(cmd)
-            self.history_index = -1
-            self.input_field.delete(0, tk.END)
+        # Lege commando's ook doorsturen (nodig voor mapping confirmations)
+        self.append_console_text("> " + cmd + "\n", "command")
+        # Nu sturen we het commando naar de aangepaste stdin
+        custom_stdin.write(cmd)
+        self.command_history.append(cmd)
+        self.history_index = -1
+        self.input_field.delete(0, tk.END)
     
     def previous_command(self, event=None):
         if not self.command_history:
@@ -556,6 +740,10 @@ def main_app():
     root = tk.Tk()
     app = APCRControllerApp(root)
     
+    # Verbeter de main.py functies met GUI-versies
+    setup_gui_enhancements()
+
+
     # Start verborgen in de tray
     root.withdraw()
      
