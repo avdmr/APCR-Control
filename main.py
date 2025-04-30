@@ -1051,8 +1051,20 @@ def set_listener_ip(settings):
         settings["listener_port"] = port
         save_settings(settings)
         print(f"Listener updated to IP: {ip or '0.0.0.0'} Port: {port}")
+        
         # Na veranderen van IP/poort opnieuw global_socket initialiseren.
         init_global_socket(settings)
+        
+        # Ook de UDP listener opnieuw initialiseren
+        udp_listener = controls.get_udp_listener_instance()
+        if udp_listener:
+            print("Restarting UDP listener with new settings...")
+            udp_listener.stop()
+        if controls.init_udp_listener(settings):
+            print(f"UDP listener restarted on {ip or '0.0.0.0'}:{port}")
+        else:
+            print("[ERROR] Failed to restart UDP listener with new settings")
+        
     except Exception as e:
         print(f"[ERROR] Failed to set listener IP: {e}")
 
@@ -2235,12 +2247,12 @@ def wait_for_mapping_input(joystick):
 def map_device_action(settings, device, action):
     """
     Map a device action to an input.
-    
+   
     Args:
         settings: Application settings
         device: The input device (joystick)
         action: The action key to map
-        
+       
     Returns:
         bool: True if successful, False otherwise
     """
@@ -2258,7 +2270,7 @@ def map_device_action(settings, device, action):
     # Ensure the device exists in settings
     if "devices" not in settings:
         settings["devices"] = {}
-        
+       
     if device_id not in settings["devices"]:
         settings["devices"][device_id] = {"name": device.get_name()}
 
@@ -2275,11 +2287,11 @@ def map_device_action(settings, device, action):
     }
     if chosen_input[0] == "axis":
         new_mapping["direction"] = chosen_input[2]
-
-    # Remove existing bindings for this input to avoid conflicts
-    remove_existing_bindings(current_mappings, ("button", new_mapping["index"]) 
-                             if new_mapping["type"] == "button" 
-                             else ("axis", new_mapping["index"]))
+        # Remove existing bindings for this specific axis+direction combination
+        remove_existing_bindings(current_mappings, ("axis", new_mapping["index"]), new_mapping["direction"])
+    else:
+        # Remove existing bindings for this button
+        remove_existing_bindings(current_mappings, ("button", new_mapping["index"]))
 
     # Add the new mapping
     if allows_multiple:
@@ -2287,7 +2299,7 @@ def map_device_action(settings, device, action):
             current_mappings[action] = []
         if any(
             m["type"] == new_mapping["type"] and m["index"] == new_mapping["index"] and
-            m.get("direction") == new_mapping.get("direction") 
+            m.get("direction") == new_mapping.get("direction")
             for m in current_mappings[action]
         ):
             print(f"This input is already mapped for '{map_name}'.")
@@ -2303,26 +2315,27 @@ def map_device_action(settings, device, action):
         str_action = str(action)
         current_mappings[str_action] = current_mappings.pop(action)
         print(f"Converted mapping key from {action} to '{str_action}'")
-    
+   
     # Save settings to file
     result = save_settings(settings)
-    
+   
     if result:
         print("Mapping saved to settings.json.")
     else:
         print("[ERROR] Failed to save mapping to settings.json.")
-    
+   
     return result
 
 
 
-def remove_existing_bindings(device_mappings, input_trigger):
+def remove_existing_bindings(device_mappings, input_trigger, direction=None):
     """
     Remove existing bindings for a specific input (button or axis) from device mappings.
     
     Args:
         device_mappings: Dictionary of mappings for the device
         input_trigger: Tuple (input_type, input_idx) specifying which input to remove
+        direction: Optional direction ("positive" or "negative") for axis inputs
         
     Returns:
         None
@@ -2337,17 +2350,33 @@ def remove_existing_bindings(device_mappings, input_trigger):
             
         if isinstance(bindings, list):
             # For actions with multiple bindings (list)
-            new_bindings = [
-                b for b in bindings 
-                if not (b.get("type") == input_type and b.get("index") == input_idx)
-            ]
+            new_bindings = []
+            for b in bindings:
+                # For axis inputs with direction specified, only remove matching direction
+                if input_type == "axis" and direction and b.get("type") == "axis" and b.get("index") == input_idx:
+                    # Keep if directions don't match
+                    if b.get("direction") != direction:
+                        new_bindings.append(b)
+                # For other inputs, remove if type and index match
+                elif not (input_type == "axis" and direction) and b.get("type") == input_type and b.get("index") == input_idx:
+                    # Remove
+                    pass
+                else:
+                    # Keep
+                    new_bindings.append(b)
+            
             if new_bindings:
                 device_mappings[action] = new_bindings
             else:
                 actions_to_remove.append(action)
         elif isinstance(bindings, dict):
             # For actions with a single binding (dict)
-            if bindings.get("type") == input_type and bindings.get("index") == input_idx:
+            if input_type == "axis" and direction:
+                # Only remove if both type, index and direction match
+                if bindings.get("type") == "axis" and bindings.get("index") == input_idx and bindings.get("direction") == direction:
+                    actions_to_remove.append(action)
+            elif bindings.get("type") == input_type and bindings.get("index") == input_idx:
+                # For non-axis or when direction doesn't matter
                 actions_to_remove.append(action)
 
     # Remove actions that no longer have bindings
@@ -2386,7 +2415,7 @@ def send_status_requests(settings):
                         
                         # Send the packet to the broadcast address, port 2390
                         temp_socket.sendto(data, (broadcast_ip, 2390))
-                        if debug_mode():
+                        if debug_mode:
                             print(f"[DEBUG] Broadcast status request sent to {broadcast_ip}:2390")
                         broadcast_success = True
                     except Exception as e:
@@ -2401,7 +2430,7 @@ def send_status_requests(settings):
                 for apcr in apcrs:
                     data = bytes.fromhex("6f6b41504352")
                     send_apcr_command(apcr, data)
-                    if debug_mode():
+                    if debug_mode:
                         print(f"[DEBUG] Individual status request sent to {apcr['name']} (CamID={apcr.get('camid')}, IP={apcr['ip']})")
             
             # Wait according to the configured frequency
@@ -2411,70 +2440,6 @@ def send_status_requests(settings):
             print(f"[ERROR] Error in status request loop: {e}")
             time.sleep(1.0)  # Wait after error to avoid tight loop
 
-def send_status_requests(settings):
-    """
-    Stuurt periodiek statusaanvragen via broadcast naar alle APC-R apparaten 
-    in het netwerk, in plaats van individueel per apparaat.
-    """
-    while True:
-        try:
-            # Haal de listener IP op uit settings
-            listener_ip = settings.get("listener_ip", "0.0.0.0")
-            
-            # Als we een specifiek luister IP hebben (niet 0.0.0.0), 
-            # bereken dan het broadcast adres
-            if listener_ip != "0.0.0.0":
-                # Converteer IP naar broadcast door laatste octet naar 255 te zetten
-                ip_parts = listener_ip.split('.')
-                if len(ip_parts) == 4:
-                    broadcast_ip = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.255"
-                else:
-                    # Fallback naar direct IP als de IP-indeling ongeldig is
-                    broadcast_ip = None
-                    debug_print(f"[DEBUG] Ongeldige IP indeling voor broadcast: {listener_ip}")
-            else:
-                # Als we op alle interfaces luisteren, kunnen we niet broadcasten
-                broadcast_ip = None
-                debug_print("[DEBUG] Kan geen broadcast maken voor 0.0.0.0, gebruik individuele IPs")
-            
-            # Verstuur broadcast als we een geldig broadcast IP hebben
-            if broadcast_ip:
-                # OKAPCR status request pakket
-                data = bytes.fromhex("6f6b41504352")
-                
-                # Maak een tijdelijke socket die broadcast toestaat
-                temp_socket = None
-                try:
-                    temp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    temp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    temp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                    temp_socket.settimeout(1)
-                    
-                    # Verstuur het pakket naar het broadcast adres, poort 2390
-                    temp_socket.sendto(data, (broadcast_ip, 2390))
-                    debug_print(f"[DEBUG] Broadcast status aanvraag verzonden naar {broadcast_ip}:2390")
-                except Exception as e:
-                    print(f"[ERROR] Broadcast status aanvraag mislukt: {e}")
-                    # Als broadcast mislukt, val terug op individuele aanvragen
-                    broadcast_ip = None
-                finally:
-                    if temp_socket:
-                        temp_socket.close()
-            
-            # Als we geen broadcast konden doen, gebruik dan individuele aanvragen
-            if not broadcast_ip:
-                apcrs = settings.get("apcrs", [])
-                for apcr in apcrs:
-                    data = bytes.fromhex("6f6b41504352")
-                    send_apcr_command(apcr, data)
-                    debug_print(f"[DEBUG] Individuele status aanvraag verzonden naar {apcr['name']} ({apcr['ip']})")
-            
-            # Wacht volgens de ingestelde frequentie
-            frequency = settings["global_settings"].get("status_request_frequency", 1.0)
-            time.sleep(frequency)
-        except Exception as e:
-            print(f"[ERROR] Fout in status aanvraag loop: {e}")
-            time.sleep(1.0)  # Wacht bij fout om te voorkomen dat we in een tight loop terecht komen
 
 def main_menu(settings):
     # Probeer eerst de stdin-buffer leeg te maken
