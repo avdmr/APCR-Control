@@ -45,6 +45,8 @@ _button_preset_mapping = {}
 _last_presets_mtime = None
 command_queue = queue.Queue()
 current_mode = "main"  
+INIT_GAP           = 2.0   # seconden pauze tussen initialisaties
+_last_init_started = 0.0   # tijdstip van laatste initialize_apcr_if_new
 
 
 logging.basicConfig(
@@ -137,29 +139,36 @@ def initialize_apcr_if_new(apcr):
         print(f"[ERROR] Failed to initialize {apcr['name']} (CamID {apcr['camid']}): {e}")
 
 def check_for_new_apcrs(settings):
-    """
-    Periodically checks if there are new APC-Rs in current_position.
-    If a new APC-R is detected, it is initialized.
-    """
+    global _last_init_started                 # ← toevoegen
     while True:
         try:
             with controls.position_lock:
                 camids_with_position = set(controls.current_position.keys())
-            
-            # Check each APC-R in settings to see if it already has a position
+
             for apcr in settings.get("apcrs", []):
                 if 'camid' not in apcr:
-                    logging.warning(f"APC-R {apcr.get('name', 'Unknown')} is missing camid field")
+                    logging.warning( ... )
                     continue
+
+                # staat er al een positie én is nog niet geïnitialiseerd?
+                if apcr['camid'] in camids_with_position and \
+                   apcr['camid'] not in _initialized_apcrs:
+
+                    # ---------- NIEUW: throttle ----------
+                    now = time.time()
+                    if now - _last_init_started < INIT_GAP:
+                        # nog even wachten; we proberen in de volgende loop
+                        continue
+                    _last_init_started = now
+                    # ---------- EINDE throttle ----------
                     
-                if apcr['camid'] in camids_with_position and apcr['camid'] not in _initialized_apcrs:
                     initialize_apcr_if_new(apcr)
-            
-            # Wait a bit before checking again
-            time.sleep(1.0)
+
+            time.sleep(1.0)          # bestaande wachttijd
         except Exception as e:
-            logging.error(f"Error in check_for_new_apcrs: {e}")
+            logging.error(...)
             time.sleep(1.0)
+
 
 def debug_print(*args):
     """Print messages only if debug_mode is on."""
@@ -1295,6 +1304,23 @@ def event_loop(settings):
         # Process joystick buttons
         for btn_idx in range(joystick.get_numbuttons()):
             pressed = joystick.get_button(btn_idx)
+            if pressed and not prev_button_state[btn_idx]:      
+                for key, mapping in device_mappings.items():    
+                    if not key.startswith("camid_"):            
+                        continue                                
+                    if mapping.get("type") != "button":         
+                        continue                                
+                    if mapping.get("index") != btn_idx:         
+                        continue                                
+                    camid_num = int(key.split("_")[1])          
+                    settings["global_settings"]["selected_camid"] = camid_num   
+                    save_settings(settings)                     
+                    print(f"Selected camid {camid_num}.")       
+                    prev_button_state[btn_idx] = pressed        
+                    break                                       
+                else:                                           
+                    pass  # geen CamID‑hit; ga verder            
+
             if pressed:
                 any_user_input = True
             if pressed != prev_button_state[btn_idx]:
@@ -1379,8 +1405,28 @@ def event_loop(settings):
         # Process joystick axes
         for axis_idx in range(joystick.get_numaxes()):
             value = joystick.get_axis(axis_idx)
-            if abs(value) > 0.5:
-                any_user_input = True
+            # --- A) **CamID‑mapping via axis** --------------------
+            if abs(value) > 0.4:
+                any_user_input = True                              
+                for key, mapping in device_mappings.items():      
+                    if not key.startswith("camid_"):               
+                        continue                                   
+                    if mapping.get("type") != "axis":             
+                        continue                                   
+                    if mapping.get("index") != axis_idx:           
+                        continue                                  
+                    dir_needed = mapping.get("direction")          
+                    dir_now    = "positive" if value > 0 else "negative"  
+                    if dir_needed != dir_now:                     
+                        continue                                   
+                    camid_num = int(key.split("_")[1])            
+                    settings["global_settings"]["selected_camid"] = camid_num   
+                    save_settings(settings)                        
+                    print(f"Selected camid {camid_num}.")          
+                    break                                         
+
+
+
             if abs(value - prev_axis_values[axis_idx]) > 0.01:
                 action_key = find_action_for_axis(device_mappings, axis_idx)
                 debug_print(f"[DEBUG] Axis {axis_idx} -> action_key:", action_key)
@@ -2076,9 +2122,12 @@ def handle_mapping(settings):
             settings["devices"][device_id] = {"name": device.get_name()}
 
         while True:
-            action = choose_mapping_action(settings, device_id)  
+            action = choose_mapping_action(settings, device_id)
             if action is None:
                 break
+            if action == "camid_menu":
+                map_camid_menu(settings, device)  # <-- nieuwe functie
+                continue
                 
             # Make sure action is a string if it's not already
             if isinstance(action, int):
@@ -2102,6 +2151,59 @@ def handle_mapping(settings):
         print(f"[ERROR] Failed to handle mapping: {e}")
         import traceback
         traceback.print_exc()
+
+
+def map_camid_menu(settings, device):
+    """
+    Submenu om CamID‑selectie aan een knop/axis te binden.
+    """
+    # Verzamel en sorteer APC‑R’s
+    apcrs = sorted(settings.get("apcrs", []), key=lambda a: a.get("camid", 0))
+    if not apcrs:
+        print("No APC‑Rs configured.")
+        return
+
+    # Device‑id ophalen
+    device_id = device.get_guid() if hasattr(device, "get_guid") else device.get_name()
+    dev_map = settings["devices"].setdefault(device_id, {"name": device.get_name()})
+
+    while True:
+        print("\nMap CamID to button:")
+        for idx, apcr in enumerate(apcrs, start=1):
+            camid = apcr.get("camid")
+            key   = f"camid_{camid}"
+            mapped = ""
+            if key in dev_map:
+                m = dev_map[key]
+                mapped = f"[{m['type']} {m['index']}]"
+            print(f"{idx}. {apcr['name']} – camID {camid} {mapped}")
+        print(f"{len(apcrs)+1}. Return")
+
+        choice = input("> ").strip().lower()
+        if choice in ("return", str(len(apcrs)+1)):
+            return
+        if not choice.isdigit() or not (1 <= int(choice) <= len(apcrs)):
+            print("Invalid choice.")
+            continue
+
+        sel_apcr = apcrs[int(choice)-1]
+        camid_key = f"camid_{sel_apcr['camid']}"
+        # --- wacht op knop/axis zoals bij wait_for_mapping_input ---
+        chosen = wait_for_mapping_input(device)
+        if chosen is None:
+            print("Mapping cancelled.")
+            continue
+
+        # bestaande binding voor die knop/axis eerst weggooien
+        remove_existing_bindings(dev_map, (chosen[0], chosen[1]))
+        # opslaan
+        dev_map[camid_key] = {
+            "type":   chosen[0],
+            "index":  chosen[1],
+            **({"direction": chosen[2]} if chosen[0]=="axis" else {})
+        }
+        save_settings(settings)
+        print(f"CamID {sel_apcr['camid']} mapped to {chosen[0]} {chosen[1]}.\n")
 
 
 def choose_device():
@@ -2166,12 +2268,15 @@ def choose_mapping_action(settings, device_id):
                     mapping_str = f"[axis {mapping['index']} {mapping['direction']}]"
         print(f"{k}. {v} {mapping_str}")
 
-    print("18. return")
+    print("18. Map CamID to button")
+    print("19. return")
 
     while True:
-        choice = input("> ").strip()
-        if choice.lower() == "return" or choice == "18":
+        choice = input("> ").strip().lower()
+        if choice in ("19", "return"):
             return None
+        if choice == "18":
+            return "camid_menu"           # speciaal signaal
         if choice in MAPPING_ACTIONS:
             return choice
         print("Invalid choice, try again.")
@@ -2479,47 +2584,49 @@ def main_menu(settings):
 
 def send_position_requests(settings):
     """
-    Periodically send position requests to the actively selected APC-R only.
-    If no APC-R is selected, no requests are sent.
+    (Re)send position requests.
+    – Tot álle APC‑R’s geïnitialiseerd zijn: poll álle camera’s.
+    – Daarna: alleen de geselecteerde CamID (zoals nu al gebeurde).
     """
     while True:
         try:
-            # Get the selected camid
+            apcrs = settings.get("apcrs", [])
+            uninit_camids = [
+                a['camid'] for a in apcrs
+                if a.get('camid') not in _initialized_apcrs
+            ]
+
+            # -- 1) Startup‑fase: niet‑geïnitialiseerde camera’s eerst --
+            if uninit_camids:
+                for apcr in apcrs:
+                    if apcr.get('camid') in uninit_camids:
+                        _send_single_position_request(apcr)
+                # kortere poll om sneller door de init‑fase te komen
+                time.sleep(0.5)
+                continue     # sla de “selected only”‑logica hieronder over
+
+            # -- 2) Normale fase: alleen de geselecteerde camID --
             selected_camid = settings["global_settings"].get("selected_camid")
-            
             if selected_camid is not None:
-                # Find the APC-R configuration matching this camid
-                selected_apcr = None
-                apcrs = settings.get("apcrs", [])
-                
                 for apcr in apcrs:
                     if apcr.get('camid') == selected_camid:
-                        selected_apcr = apcr
+                        _send_single_position_request(apcr)
                         break
-                
-                if selected_apcr:
-                    # Build the position request packet with the correct camid in the second byte
-                    camid_hex = f"{selected_camid:02x}"
-                    data_hex = "08" + camid_hex + "0400000e140000"
-                    data = bytes.fromhex(data_hex)
-                    
-                    # Send the packet
-                    send_apcr_command(selected_apcr, data)
-                    if debug_mode:
-                        print(f"[DEBUG] Position request sent to {selected_apcr['name']} (CamID={selected_camid}, IP={selected_apcr['ip']})")
-                else:
-                    if debug_mode:
-                        print(f"[DEBUG] No APC-R configuration found for selected CamID {selected_camid}")
-            else:
-                if debug_mode:
-                    print("[DEBUG] No CamID selected, no position requests sent")
-            
-            # Wait according to the configured frequency
-            frequency = settings["global_settings"].get("position_request_frequency", 1.2)
-            time.sleep(frequency)
+
+            freq = settings["global_settings"].get("position_request_frequency", 1.2)
+            time.sleep(freq)
+
         except Exception as e:
             print(f"[ERROR] Error in position request loop: {e}")
-            time.sleep(1.0)  # Wait after error to avoid tight loop
+            time.sleep(1.0)
+
+def _send_single_position_request(apcr):
+    camid_hex = f"{apcr['camid']:02x}"
+    data = bytes.fromhex("08" + camid_hex + "0400000e140000")
+    send_apcr_command(apcr, data)
+    if debug_mode:
+        print(f"[DEBUG] Position request sent to {apcr['name']} (CamID {apcr['camid']})")
+
 
 def main():
     settings = load_settings()
