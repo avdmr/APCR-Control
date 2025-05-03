@@ -11,6 +11,7 @@ import re
 
 active_handlers = []
 _zoom_active = False
+_global_position_cache = {} 
 
 # Zorg dat PRESETS_FILE een string is
 PRESETS_FILE = "presets.json"
@@ -39,14 +40,10 @@ def trigger_status_update():
         except Exception as e:
             logging.error(f"Error triggering status update for a handler: {e}")
 
-def get_position_values(apcr):
+def get_position_values(apcr, use_cache=True):
     """
     Haalt de huidige positie op van de camera via controls.get_current_position.
-    Geeft een dictionary met de waarden:
-      - pan: direct uit positie (absolute waarde)
-      - tilt: direct uit positie (absolute waarde)
-      - roll: direct uit positie (absolute waarde)
-      - zoom: percentage als geheel getal, waarbij 1 overeenkomt met 0% en 4095 met 100%
+    Als use_cache=True en er is geen verse data, gebruik dan de cache.
     """
     pos_str = controls.get_current_position(apcr)
     if pos_str:
@@ -57,17 +54,25 @@ def get_position_values(apcr):
                 tilt = float(parts[3])
                 roll = float(parts[4])
                 zoom_val = float(parts[5])
-                # Bereken zoompercentage: (zoom - 1) komt overeen met 0 tot 4094
+                # Bereken zoompercentage
                 zoom_percentage = (zoom_val - 1) * 100 / 4094
-                # Rond af naar het dichtstbijzijnde gehele getal
-                return {
+                position_data = {
                     'pan': pan,
                     'tilt': tilt,
                     'roll': roll,
                     'zoom': int(round(zoom_percentage))
                 }
+                # Update de globale cache direct hier
+                if '_global_position_cache' in globals():
+                    _global_position_cache[apcr.get('camid')] = position_data.copy()
+                return position_data
             except Exception as e:
                 logging.error(f"Error computing position values: {e}")
+    
+    # Als we geen data hebben maar use_cache is True, gebruik de cache
+    if use_cache and '_global_position_cache' in globals():
+        return _global_position_cache.get(apcr.get('camid'))
+    
     return None
 
 
@@ -128,18 +133,36 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
     send_apcr_command_func = None
     get_active_apcr_func = None
     save_settings_func = None
-    
+    write_lock = threading.Lock()
+
     def setup(self):
         super().setup()
         self.stop_event = threading.Event()
         self.connected = False
         active_handlers.append(self)
+        
+        try:
+            self.request.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 128 * 1024)
+            self.request.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 128 * 1024)
+        except OSError:
+            # Fallback 
+            try:
+                self.request.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
+                self.request.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024)
+            except OSError:
+                logging.warning("Could not increase socket buffer size")
+
+        self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        
+        # Voor command throttling
+        self._command_in_progress = threading.Event()
+        self._last_command_time = 0
+        self._last_known_positions = {}
 
     def finish(self):
         if self in active_handlers:
             active_handlers.remove(self)
         super().finish()
-
 
 
     def send_status_packet(self):
@@ -168,6 +191,12 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
                 # Haal positiegegevens op
                 pos = get_position_values(active_apcr)
                 if pos:
+                    # Update onze cache met de nieuwe waarden
+                    self._last_known_positions[camid] = pos.copy()
+                else:
+                    # Gebruik de laatst bekende waarden als beschikbaar
+                    pos = self._last_known_positions.get(camid)
+                if pos:
                     # Build packet with camera-specific virtual wall settings
                     has_pan_wall = (active_apcr.get("virtualwallstart_pan") is not None and 
                                     active_apcr.get("virtualwallend_pan") is not None)
@@ -182,12 +211,12 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
                         f"HASVWPAN{1 if has_pan_wall else 0};"
                         f"HASVWTILT{1 if has_tilt_wall else 0};}}"
                     )
+                    self.safe_write(status_packet)
                 else:
                     status_packet = f"{{CAM{camid};PTS{ptr_speed};ZS{zoom_speed};PRES_D{preset_speed};ADAPT{adaptive_speed};}}"
             else:
                 status_packet = "{CAM0;PTS0;ZS0;SS0;ADAPT0;}"
-            self.wfile.write(status_packet.encode('utf-8'))
-            self.wfile.flush()
+            self.safe_write(status_packet)
         except Exception as e:
             logging.error(f"Immediate status update error: {e}")
 
@@ -197,11 +226,16 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
     def send_status_loop(self):
         while not self.stop_event.is_set():
             try:
+                # Nieuwe code: check of er een commando actief is
+                if self._command_in_progress.is_set():
+                    time.sleep(0.1)
+                    continue
+                    
                 active_apcr = None
                 if MiddlethingsHandler.get_active_apcr_func:
                     active_apcr = MiddlethingsHandler.get_active_apcr_func(MiddlethingsHandler.settings)
                 if not active_apcr:
-                    status_packet = "{CAM0;PTS0;ZS0;SS0;ADAPT0;}\n"
+                    status_packet = "{CAM0;PTS0;ZS0;SS0;ADAPT0;}"
                 else:
                     camid = active_apcr.get('camid', 0)
                     gs = self.settings["global_settings"]
@@ -217,17 +251,15 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
                     zoom_speed = gs.get("zoom_speed", 100)
                     preset_speed = gs.get("preset_transition_speed", 100)
                     adaptive_speed = "1" if gs.get("adaptive_speed", False) else "0"
-
                     pos = get_position_values(active_apcr)
                     if pos:
                         status_packet = (
                             f"{{CAM{camid};PTS{ptr_speed};ZS{zoom_speed};PRES_D{preset_speed};"
                             f"aPAN{pos['pan']};aTILT{pos['tilt']};aROLL{pos['roll']};"
-                            f"aZOOM{pos['zoom']};ADAPT{adaptive_speed};}}\n"
+                            f"aZOOM{pos['zoom']};ADAPT{adaptive_speed};}}"
                         )
                     else:
-                        status_packet = f"{{CAM{camid};PTS{ptr_speed};ZS{zoom_speed};PRES_D{preset_speed};ADAPT{adaptive_speed};}}\n"
-
+                        status_packet = f"{{CAM{camid};PTS{ptr_speed};ZS{zoom_speed};PRES_D{preset_speed};ADAPT{adaptive_speed};}}"
                     # Indien er ook presets zijn, kun je die (zoals voorheen) toevoegen aan het pakket
                     presets_list = presets_cache.get_presets(camid)
                     for key in presets_list:
@@ -236,53 +268,105 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
                             if slot_num.isdigit():
                                 try:
                                     slot = int(slot_num)
-                                    status_packet = status_packet.rstrip("\n")  # verwijder newline tijdelijk
-                                    status_packet += f"PRES_D{slot};PRES_C{slot};"
+                                    status_packet = status_packet.rstrip() + f"PRES_D{slot};PRES_C{slot};"
                                 except ValueError:
                                     pass
-                    status_packet = status_packet.rstrip("\n") + "\n"
+                    #status_packet = status_packet.rstrip("\n") + "\n"
                     
-                self.wfile.write(status_packet.encode('utf-8'))
-                self.wfile.flush()
+                self.safe_write(status_packet)
                 if MiddlethingsHandler.settings and MiddlethingsHandler.settings.get("debug_mode", False):
                     print(f"[DEBUG] Sent status packet: {status_packet.strip()}")
             except Exception as e:
                 logging.error(f"Error sending status packet: {e}")
                 self.connected = False
                 break
-            time.sleep(5)
+            time.sleep(1)
+
+    def send_chunked_status(self, status_packet):
+        """Send large status packets in chunks to prevent buffer overflow."""
+        CHUNK_SIZE = 4096  # 4KB chunks
+        
+        try:
+            encoded_packet = status_packet.encode('utf-8')
+            
+            if len(encoded_packet) <= CHUNK_SIZE:
+                # No split needed
+                with MiddlethingsHandler.write_lock:
+                    self.wfile.write(encoded_packet)
+                    self.wfile.flush()
+            else:
+                # Splits in chunks
+                with MiddlethingsHandler.write_lock:
+                    for i in range(0, len(encoded_packet), CHUNK_SIZE):
+                        chunk = encoded_packet[i:i+CHUNK_SIZE]
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        time.sleep(0.01) # pause between chunks
+        except Exception as e:
+            logging.error(f"Error sending chunked status: {e}")
+            raise
 
 
     def handle(self):
         client_ip = self.client_address[0]
         print(f"Bitfocus Companion connected from {client_ip}")
+
         try:
-            # Simuleer connectieproces
-            for msg in ["STATUS: disconnected - null\n", "STATUS: connecting - null\n", "STATUS: connecting - null\n", "STATUS: ok - null\n"]:
-                self.wfile.write(msg.encode('utf-8'))
-                self.wfile.flush()
-                time.sleep(0.2)
+            # ---------- minimale handshake ----------
+            HANDSHAKE = [
+                "STATUS: disconnected - null",
+                "STATUS: connecting - null",
+                "STATUS: ok - null",
+            ]
+            for i, msg in enumerate(HANDSHAKE):
+                self.safe_write(msg)        # LF‑afsluiting
+                if i < len(HANDSHAKE) - 1:  # 2 × 70 ms ≈ 140 ms totaal
+                    time.sleep(0.07)
+
+            # 100 ms rust zodat buffer leeg is vóór eerste status‑pakket
+            time.sleep(0.10)
+
+            # ---------- status‑thread starten ----------
             self.connected = True
             self.stop_event.clear()
-            self.status_thread = threading.Thread(target=self.send_status_loop, daemon=True)
+            self.status_thread = threading.Thread(
+                target=self.send_status_loop, daemon=True
+            )
             self.status_thread.start()
+
+            # ---------- command‑loop ----------
             while self.connected:
                 data = self.rfile.readline()
                 if not data:
                     print("No data received from Companion, connection broken")
                     break
-                message = data.decode('utf-8').strip()
+
+                message = data.decode("utf-8").strip()
                 print(f"Received from Companion: {message}")
+
                 response = self.process_command(message)
                 if response:
-                    self.wfile.write(response.encode('utf-8') + b'\n')
-                    self.wfile.flush()
+                    self.safe_write(response)
+
         except Exception as e:
             print(f"General error in connection function: {e}")
+
         finally:
             self.stop_event.set()
             self.connected = False
             print(f"Connection with {client_ip} broken")
+
+
+
+    def safe_write(self, text: str):
+        """Thread‑safe write met gegarandeerde LF‐afsluiting (geen CR)."""
+        if not text.endswith("\n"):
+            text = text.rstrip("\r\n") + "\n"     
+        data = text.encode("utf-8")
+
+        with MiddlethingsHandler.write_lock:
+            self.wfile.write(data)
+            self.wfile.flush()
 
     # -------------------------------
     # Nieuwe mapping van Companion-commando's
@@ -294,14 +378,20 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
         """
         Process incoming commands from Companion using a mapping dictionary.
         """
+        self._command_in_progress.set()
+        self._last_command_time = time.time()
+        
         cmd = command.strip().upper()
 
         # Handle camera selection commands (CAM1, CAM2, etc.)
         if cmd.startswith("CAM"):
             num_part = cmd[3:]
             if num_part.isdigit():
-                return self.handle_camera_selection(num_part)
-                
+                result = self.handle_camera_selection(num_part)
+            
+                threading.Timer(0.2, self._command_in_progress.clear).start()
+                return result
+                    
         # Handle preset recall commands (PRESET1C2, PRESET5C1, etc.)
         preset_recall_match = re.match(r'PRESET(\d+)C(\d+)', cmd)
         if preset_recall_match:
@@ -350,8 +440,24 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
             "ADAPTIVESPEED":self.handle_adaptive_speed,
         }
         if cmd in companion_mapping:
-            return companion_mapping[cmd]()
+            # WIJZIG DIT DEEL:
+            # Van: return companion_mapping[cmd]()
+            # Naar:
+            def execute_command():
+                try:
+                    result = companion_mapping[cmd]()
+                    self.safe_write(result)
+                except Exception as e:
+                    logging.error(f"Error executing command {cmd}: {e}")
+                finally:
+                    threading.Timer(0.2, self._command_in_progress.clear).start()
+            
+            # Start commando in aparte thread
+            threading.Thread(target=execute_command, daemon=True).start()
+            return "COMMAND: ACK"  # Direct bevestigen
         else:
+            # NIEUWE CODE: Reset ook hier
+            threading.Timer(0.2, self._command_in_progress.clear).start()
             return "ERROR: UNKNOWN_COMMAND"
 
     def get_effective_ptr_speed(self, apcr):
@@ -452,7 +558,7 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
             
             # Recall the preset
             presets.recall_preset(cam_id_int, slot_id_int, target_apcr, self.settings)
-            
+            threading.Timer(0.05, self.send_status_packet).start()  
             return f"PRESET {slot_id}C{cam_id} RECALLED"
         except Exception as e:
             logging.error(f"Error recalling preset: {e}")
@@ -561,6 +667,7 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
             control_type='button',
             settings=self.settings
         )
+        threading.Timer(0.05, self.send_status_packet).start()
         return f"PAN_L: CamID {active_apcr['camid']} ({active_apcr['name']})"
 
     def handle_pan_right(self):
@@ -578,12 +685,14 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
             control_type='button',
             settings=self.settings
         )
+        threading.Timer(0.05, self.send_status_packet).start()
         return f"PAN_R: CamID {active_apcr['camid']} ({active_apcr['name']})"
 
     def handle_pan_idle(self):
         active_apcr = MiddlethingsHandler.get_active_apcr_func(MiddlethingsHandler.settings)
         if active_apcr:
             controls.stop_movement("pan", MiddlethingsHandler.send_apcr_command_func, active_apcr)
+            threading.Timer(0.05, self.send_status_packet).start()
             return f"PAN_IDLE: CamID {active_apcr['camid']} ({active_apcr['name']})"
         else:
             return "ERROR: NO_ACTIVE_CAMERA"
@@ -603,6 +712,7 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
             control_type='button',
             settings=self.settings
         )
+        threading.Timer(0.05, self.send_status_packet).start()
         return "COMMAND: ACK"
 
     def handle_tilt_down(self):
@@ -620,11 +730,13 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
             control_type='button',
             settings=self.settings
         )
+        threading.Timer(0.05, self.send_status_packet).start()
         return "COMMAND: ACK"
 
     def handle_tilt_idle(self):
         active_apcr = MiddlethingsHandler.get_active_apcr_func(MiddlethingsHandler.settings)
         if active_apcr:
+            threading.Timer(0.05, self.send_status_packet).start()
             controls.stop_movement("tilt", MiddlethingsHandler.send_apcr_command_func, active_apcr)
             return "COMMAND: ACK"
         else:
@@ -649,6 +761,7 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
             control_type='button',
             settings=self.settings
         )
+        threading.Timer(0.05, self.send_status_packet).start()
         return f"ROLL_L: CamID {active_apcr['camid']} ({active_apcr['name']})"
 
     def handle_roll_right(self):
@@ -669,6 +782,7 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
             control_type='button',
             settings=self.settings
         )
+        threading.Timer(0.05, self.send_status_packet).start()
         return f"ROLL_R: CamID {active_apcr['camid']} ({active_apcr['name']})"
 
     def handle_roll_idle(self):
@@ -678,11 +792,43 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
         active_apcr = MiddlethingsHandler.get_active_apcr_func(MiddlethingsHandler.settings)
         if active_apcr:
             controls.stop_movement("roll", MiddlethingsHandler.send_apcr_command_func, active_apcr)
+            threading.Timer(0.05, self.send_status_packet).start()
             return f"ROLL_IDLE: CamID {active_apcr['camid']} ({active_apcr['name']})"
         else:
             return "ERROR: NO_ACTIVE_CAMERA"
 
-
+    def handle_movement_command(self, as_name, direction, percentage):
+        """Helper functie voor bewegingscommando's"""
+        active_apcr = MiddlethingsHandler.get_active_apcr_func(MiddlethingsHandler.settings)
+        if not active_apcr:
+            return "ERROR: NO_ACTIVE_CAMERA"
+        
+        # Verhoog tijdelijk de positie request frequentie
+        original_freq = self.settings["global_settings"].get("position_request_frequency", 1.2)
+        self.settings["global_settings"]["position_request_frequency"] = 0.1
+        
+        # Start beweging
+        controls.start_or_update_movement(
+            as_name=as_name,
+            direction=direction,
+            percentage=percentage,
+            send_apcr_command=MiddlethingsHandler.send_apcr_command_func,
+            apcr=active_apcr,
+            control_type='button',
+            settings=self.settings
+        )
+        
+        # Herstel oorspronkelijke frequentie na 1 seconde
+        def restore_frequency():
+            self.settings["global_settings"]["position_request_frequency"] = original_freq
+        
+        threading.Timer(1.0, restore_frequency).start()
+        
+        # Stuur status update na korte vertraging
+        threading.Timer(0.05, self.send_status_packet).start()
+        
+        return f"{as_name.upper()}_{direction.upper()}: CamID {active_apcr['camid']}"
+        
     def handle_zoom_in(self):
         active_apcr = MiddlethingsHandler.get_active_apcr_func(MiddlethingsHandler.settings)
         if not active_apcr:
@@ -1065,10 +1211,39 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
                     break
             
             if target_apcr:
+                # Set command in progress flag om status updates te vertragen
+                self._command_in_progress.set()
+                
+                # Update de camera selectie
                 self.settings["global_settings"]["selected_camid"] = new_cam_id
-                if MiddlethingsHandler.save_settings_func:
-                    MiddlethingsHandler.save_settings_func(self.settings)
-                trigger_status_update()
+                
+                # Save settings asynchroon
+                def save_and_update():
+                    try:
+                        if MiddlethingsHandler.save_settings_func:
+                            MiddlethingsHandler.save_settings_func(self.settings)
+                        
+                        # Wacht even voordat we status update triggeren
+                        time.sleep(0.1)
+                        
+                        # Reset position cache voor de nieuwe camera
+                        if hasattr(self, '_last_known_positions'):
+                            self._last_known_positions.clear()
+                        
+                        # Trigger status update
+                        trigger_status_update()
+                        
+                        # Reset de command flag na korte tijd
+                        time.sleep(0.2)
+                        self._command_in_progress.clear()
+                        
+                    except Exception as e:
+                        logging.error(f"Error in save_and_update: {e}")
+                        self._command_in_progress.clear()
+                
+                # Start save en update in aparte thread
+                threading.Thread(target=save_and_update, daemon=True).start()
+                
                 msg = f"SELECT_CAM: ACK (set to {new_cam_id}, {target_apcr['name']} at {target_apcr['ip']})"
                 print(msg)
                 return msg
@@ -1084,7 +1259,19 @@ class MiddlethingsHandler(socketserver.StreamRequestHandler):
             print(msg)
             return msg
 
-
+    def reset_position_cache_for_camera(self, camid=None):
+        """Reset de positie cache voor een specifieke camera of alle camera's."""
+        if camid:
+            if hasattr(self, '_last_known_positions') and camid in self._last_known_positions:
+                del self._last_known_positions[camid]
+            if '_global_position_cache' in globals() and camid in _global_position_cache:
+                del _global_position_cache[camid]
+        else:
+            # Reset alle caches
+            if hasattr(self, '_last_known_positions'):
+                self._last_known_positions.clear()
+            if '_global_position_cache' in globals():
+                _global_position_cache.clear()
 
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
