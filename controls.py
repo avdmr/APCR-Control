@@ -60,7 +60,7 @@ def user_input_received():
     global last_input_time
     last_input_time = time.time()
 
-def check_virtual_wall_during_position_update(axis, current_pos, wall_start, wall_end):
+def check_virtual_wall_during_position_update(axis, apcr, current_pos, wall_start, wall_end):
     """
     Wordt periodiek aangeroepen (bij positie-update) voor de geselecteerde camID 
     zolang de laatste input binnen 2 seconden was.
@@ -78,7 +78,7 @@ def check_virtual_wall_during_position_update(axis, current_pos, wall_start, wal
         return
 
     # Roep de update functie aan met de huidige positie en de laatst ontvangen delta
-    block, trigger_correction = update_virtual_wall_state(axis, current_pos, last_command_delta, wall_start, wall_end)
+    block, trigger_correction = update_virtual_wall_state(axis, apcr, current_pos, last_command_delta, wall_start, wall_end)
     if block:
         print(f"[VirtualWall Update] {axis} input wordt nog geblokkeerd op basis van actuele positie.")
     else:
@@ -312,7 +312,7 @@ def stop_movement(as_name, send_apcr_command, apcr):
         st['idle_timer'].start()
 
 
-def start_or_update_movement(as_name, direction, percentage, send_apcr_command, apcr, control_type='axis', settings=None):
+def start_or_update_movement(as_name, direction, percentage, send_apcr_command, apcr, control_type='axis', axis_idx=None, settings=None):
     st = movement_state[as_name]
     changed = (
         st['direction'] != direction or
@@ -322,6 +322,24 @@ def start_or_update_movement(as_name, direction, percentage, send_apcr_command, 
     
     # Als we de beweging starten of updaten, pas dan adaptive speed toe voor pan/tilt als dat nodig is
     applying_adaptive_speed = False
+    
+    if control_type == 'axis' and axis_idx is not None and settings:
+        device_id = apcr.get("device_id") or "default"
+        dev_map   = settings.get("devices", {}).get(device_id, {})
+        for m in dev_map.values():
+            if isinstance(m, dict):
+                if m.get("type") == "absolute_axis" and m.get("index") == axis_idx:
+                    return          # deze axis is slider → geen beweging
+                if m.get("type") == "virtual_axis" and axis_idx in (m.get("axis_0"), m.get("axis_1")):
+                    return
+            elif isinstance(m, list):
+                if any(
+                    (sub.get("type") == "absolute_axis" and sub.get("index") == axis_idx) or
+                    (sub.get("type") == "virtual_axis"  and axis_idx in (sub.get("axis_0"), sub.get("axis_1")))
+                    for sub in m
+                ):
+                    return
+    
     original_percentage = percentage
     
     if as_name in ['pan', 'tilt', 'roll'] and settings and settings.get("global_settings", {}).get("adaptive_speed", False):
@@ -425,7 +443,7 @@ def virtual_wall_predictor(settings, apcr, as_name, update_interval=0.05):
         # Controleer met de update-functie of de voorspelde positie binnen de muur (met de extra marge) komt.
         # Hiervoor voegen we een extra margeparameter toe aan update_virtual_wall_state.
         block, _ = update_virtual_wall_state(
-            as_name, predicted_pos, 0, wall_start, wall_end,
+            as_name, predicted_pos, 0, wall_start, wall_end, apcr,
             virtualwall_active=settings["global_settings"].get("virtualwall", True),
             margin=predictor_margin
         )
