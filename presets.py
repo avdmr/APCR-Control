@@ -96,25 +96,13 @@ def to_little_endian_signed(val):
 
 def native_to_normalized(angle):
     """
-    Convert from gimbal's native coordinate system (-1800 to +1800 tenths)
-    to normalized 0-360 degrees space.
-    
-    Args:
-        angle: Angle in native system (degrees or tenths)
-        
-    Returns:
-        float: Angle in 0-360 degrees space
+    Convert native gimbal units (−1800 … +1800 tenth °) of FDB’s
+    naar 0 … 360 ° “normale” ruimte.
     """
-    # First convert to degrees if in tenths
-    angle_deg = angle / 10.0 if abs(angle) > 180 else angle
-    
-    # Map the range [-180, 180] to [0, 360]
-    if angle_deg >= 0:
-        normalized = angle_deg
-    else:
-        normalized = 360 + angle_deg
-        
-    return normalized
+    if abs(angle) > 359:          # FDB → tenth‑of‑degree
+        angle = angle / 10.0
+    return angle % 360.0
+
 
 def normalized_to_native(angle):
     """
@@ -831,24 +819,6 @@ def inWall(angle, w1, w2):
     logging.debug(f"inWall: native={angle} (norm={angle_norm}°), wall=[{wall_start}°, {wall_end}°] => {'IN WALL' if result else 'OUTSIDE WALL'}")
     return result
 
-def native_to_normalized(angle):
-    """
-    Convert from gimbal's native coordinate system (-1800 to +1800 tenths)
-    to normalized 0-360 degrees space.
-    
-    Args:
-        angle: Angle in native system (degrees or tenths)
-        
-    Returns:
-        float: Angle in 0-360 degrees space
-    """
-    # First convert to degrees if in tenths
-    angle_deg = angle / 10.0 if abs(angle) > 359 else angle
-    
-    # Map the range [-180, 180] to [0, 360]
-    normalized = angle_deg % 360.0
-    
-    return normalized
 
 # =============================================================================
 # Main Preset Recall Function
