@@ -2574,7 +2574,7 @@ def handle_absolute_setting(key, percentage, apcr, settings):
         # Stuur alleen als we niet te vaak updaten (voorkom spamming)
         current_time = time.time()
         last_zoom_time = getattr(handle_absolute_setting, "last_zoom_time", 0)
-        if current_time - last_zoom_time > 0.1:  # Max 10 updates per seconde
+        if current_time - last_zoom_time > 0.05:  # Max 10 updates per seconde
             handle_absolute_setting.last_zoom_time = current_time
             
             if debug_mode:
@@ -2590,7 +2590,7 @@ def handle_absolute_setting(key, percentage, apcr, settings):
         # Beperk schrijffrequentie naar settings.json om SSD-slijtage te voorkomen
         current_time = time.time()
         last_save_time = getattr(handle_absolute_setting, "last_save_time", 0)
-        if current_time - last_save_time > 0.1:  # Max 100x per seconde opslaan
+        if current_time - last_save_time > 0.05:  # Max 100x per seconde opslaan
             handle_absolute_setting.last_save_time = current_time
             save_settings(settings)
             
